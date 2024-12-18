@@ -1,0 +1,16 @@
+- hosts: all
+  remote_user: lwfuser
+  vars:
+    directory: "/home/lwfuser/Repo"
+  tasks:
+    - name: "hostname"
+      command: "hostname"
+
+    - name: "Current folders"
+      command: "ls {{directory}}"
+      register: repo_dirs
+      changed_when: false
+
+    - name: Show directories
+      debug:
+        var: repo_dirs.stdout_lines
