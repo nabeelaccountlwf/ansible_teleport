@@ -1,7 +1,7 @@
 - hosts: all
   remote_user: lwfuser
   vars:
-    directory: "/home/lwfuser/Repo"
+    directory: "/home/lwfuser"
   tasks:
     - name: "hostname"
       command: "hostname"

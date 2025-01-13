@@ -1,0 +1,225 @@
+---
+- name: LWF Setup
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars_prompt:
+    - name: new_hostname
+      prompt: "Please enter the new hostname"
+      private: no
+
+    - name: ip_address
+      prompt: "Enter IP_ADDRESS"
+      default: "192.168.8.100/24"
+      private: no
+
+    - name: gateway
+      prompt: "Enter GATEWAY"
+      default: "192.168.8.254"
+      private: no
+
+    - name: dns
+      prompt: "Enter DNS"
+      default: "8.8.8.8"
+      private: no
+
+    - name: con_name
+      prompt: "Enter CON_NAME (nmcli connection name)"
+      default: "Wired connection 1"
+      private: no
+
+  tasks:
+
+    ###################################################################
+    # Hostname tasks
+    ###################################################################
+    - name: Set the system hostname
+      hostname:
+        name: "{{ new_hostname }}"
+
+    - name: Update /etc/hosts with new hostname
+      lineinfile:
+        path: /etc/hosts
+        regexp: '^127\.0\.1\.1\s+.*$'
+        line: "127.0.1.1    {{ new_hostname }}"
+      notify:
+        - restart systemd-logind
+
+    ###################################################################
+    # Network configuration (nmcli)
+    ###################################################################
+    - name: Check if nmcli is installed
+      ansible.builtin.command: which nmcli
+      register: nmcli_check
+      changed_when: false
+      failed_when: false
+
+    - name: Configure network with nmcli (if nmcli is present)
+      block:
+        - name: Check if network connection exists
+          command: nmcli con show "{{ con_name }}"
+          register: nmcli_connection
+          changed_when: false
+          failed_when: nmcli_connection.rc not in [0,4]
+
+        - name: Configure the IP if connection exists
+          command: >
+            nmcli con mod "{{ con_name }}"
+            ipv4.addresses "{{ ip_address }}"
+            ipv4.gateway "{{ gateway }}"
+            ipv4.dns "{{ dns }}"
+            ipv4.method "manual"
+          when: nmcli_connection.rc == 0
+
+        - name: Bring up the connection
+          command: nmcli con up "{{ con_name }}"
+          when: nmcli_connection.rc == 0
+      when: nmcli_check.rc == 0
+
+    ###################################################################
+    # Disable IPv6
+    ###################################################################
+    - name: Disable IPv6 in /etc/sysctl.conf
+      # We use blockinfile to append only once, avoiding duplicates
+      blockinfile:
+        path: /etc/sysctl.conf
+        backup: true
+        block: |
+          net.ipv6.conf.all.disable_ipv6 = 1
+          net.ipv6.conf.default.disable_ipv6 = 1
+      notify:
+        - reload sysctl
+
+    ###################################################################
+    # Install and configure unattended-upgrades
+    ###################################################################
+    - name: Install unattended-upgrades
+      apt:
+        name: unattended-upgrades
+        state: present
+        update_cache: true
+
+    - name: Enable security updates in /etc/apt/apt.conf.d/50unattended-upgrades
+      lineinfile:
+        path: /etc/apt/apt.conf.d/50unattended-upgrades
+        regexp: '^.*"{{ distro_id }}:{{ distro_codename }}-security";'
+        line: '        "${distro_id}:${distro_codename}-security";'
+        state: present
+      when: ansible_facts['os_family'] == 'Debian'
+
+    - name: Enable "-updates" in /etc/apt/apt.conf.d/50unattended-upgrades
+      lineinfile:
+        path: /etc/apt/apt.conf.d/50unattended-upgrades
+        regexp: '^.*"{{ distro_id }}:{{ distro_codename }}-updates";'
+        line: '        "${distro_id}:${distro_codename}-updates";'
+        state: present
+      when: ansible_facts['os_family'] == 'Debian'
+
+    - name: Enable "-backports" in /etc/apt/apt.conf.d/50unattended-upgrades
+      lineinfile:
+        path: /etc/apt/apt.conf.d/50unattended-upgrades
+        regexp: '^.*"{{ distro_id }}:{{ distro_codename }}-backports";'
+        line: '        "${distro_id}:${distro_codename}-backports";'
+        state: present
+      when: ansible_facts['os_family'] == 'Debian'
+
+    - name: Run unattended-upgrades
+      command: unattended-upgrades -d
+      when: ansible_facts['os_family'] == 'Debian'
+
+    ###################################################################
+    # Create new user lwfuser
+    ###################################################################
+    - name: Create the lwfuser account
+      user:
+        name: lwfuser
+        shell: /bin/bash
+        groups: sudo
+        append: true
+        create_home: true
+
+    - name: Set lwfuser password
+      # In practice, you’d store a hashed password or use an Ansible vault
+      user:
+        name: lwfuser
+        password: "{{ 'MySuperSecretPassword' | password_hash('sha512') }}"
+
+    - name: Add lwfuser to sudoers with NOPASSWD
+      lineinfile:
+        path: /etc/sudoers
+        line: 'lwfuser ALL=(ALL) NOPASSWD:ALL'
+        validate: 'visudo -cf %s'
+        state: present
+
+    ###################################################################
+    # Remove the nvidia user if it exists
+    ###################################################################
+    - name: Remove nvidia user if exists
+      user:
+        name: nvidia
+        state: absent
+        remove: yes
+
+    ###################################################################
+    # Set default to multi-user.target
+    ###################################################################
+    - name: Set default target to multi-user
+      command: systemctl set-default multi-user.target
+      register: systemd_default
+      changed_when: "'Created symlink' in systemd_default.stdout or 'Removed' in systemd_default.stdout"
+
+    ###################################################################
+    # Install additional packages (ncdu, locate, tcpdump, plocate)
+    ###################################################################
+    - name: Install common utilities
+      apt:
+        name:
+          - ncdu
+          - locate
+          - tcpdump
+          - plocate
+        state: present
+        update_cache: true
+      when: ansible_facts['os_family'] == 'Debian'
+
+    ###################################################################
+    # Add cron job for updatedb (runs every hour on the hour)
+    ###################################################################
+    - name: Add updatedb cron job
+      cron:
+        name: "updatedb"
+        minute: "0"
+        hour: "*"
+        job: "/usr/bin/updatedb"
+
+    ###################################################################
+    # Set Jetson into performance mode if not already
+    ###################################################################
+    - name: Check if nvpmodel is present
+      command: which nvpmodel
+      register: nvpmodel_check
+      changed_when: false
+      failed_when: false
+
+    - name: Ensure Jetson is in MAXN performance mode
+      block:
+        - name: Check current NV power mode
+          command: nvpmodel -q
+          register: nvpmodel_current
+          changed_when: false
+
+        - name: Set Jetson to MAXN mode if not already set
+          command: nvpmodel -m 0 --force
+          when: "'NV Power Mode: MAXN' not in nvpmodel_current.stdout"
+      when: nvpmodel_check.rc == 0
+
+  handlers:
+    - name: restart systemd-logind
+      service:
+        name: systemd-logind
+        state: restarted
+
+    - name: reload sysctl
+      command: sysctl -p
+      become: yesHi 
